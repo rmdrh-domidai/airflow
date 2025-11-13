@@ -231,7 +231,7 @@ with DAG(
     dag_id="gsheets_viviendas_propietarios_to_postgres",
     default_args=default_args,
     start_date=datetime(2025, 11, 1),
-    schedule_interval=None,
+    schedule=None,
     catchup=False,
     tags=["gsheets", "postgres", "viviendas", "propietarios"],
 ) as dag:
