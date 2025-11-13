@@ -78,6 +78,8 @@ x-airflow-common:
       pymssql
       apache-airflow-providers-mysql
       mysqlclient
+      apache-airflow-providers-google
+      pandas
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
   volumes:
