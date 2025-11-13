@@ -6,7 +6,7 @@ import pandas as pd
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.google.sheets.hooks.sheets import GSheetsHook
+from airflow.providers.google.suite.hooks.sheets import GSheetsHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 
