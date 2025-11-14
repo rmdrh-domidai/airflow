@@ -36,14 +36,31 @@ def _normalize_col(col: str) -> str:
 
 def read_sheet_as_df() -> pd.DataFrame:
     hook = GSheetsHook(gcp_conn_id=GOOGLE_CONN_ID)
-    values = hook.get_values(spreadsheet_id=SPREADSHEET_ID, range_name=RANGE_VIVIENDAS)
+    values = hook.get_values(spreadsheet_id=SPREADSHEET_ID, range_=RANGE_VIVIENDAS)
+
     if not values or len(values) < 2:
         return pd.DataFrame()
 
-    header = values[0]
-    rows = values[1:]
-    df = pd.DataFrame(rows, columns=header).fillna("")
+    header = values[0]      # primera fila = nombres de columnas (16)
+    rows = values[1:]       # resto de filas
+
+    # --- Normalizar longitud de filas ---
+    n_cols = len(header)
+
+    padded_rows = []
+    for r in rows:
+        # si la fila tiene menos columnas, rellenamos con ""
+        if len(r) < n_cols:
+            r = r + [""] * (n_cols - len(r))
+        # si tiene más (por algún motivo), recortamos
+        elif len(r) > n_cols:
+            r = r[:n_cols]
+        padded_rows.append(r)
+
+    df = pd.DataFrame(padded_rows, columns=header).fillna("")
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+
+    # normalizar nombres de columnas
     df.columns = [_normalize_col(c) for c in df.columns]
 
     rename_hint = {
@@ -65,7 +82,9 @@ def read_sheet_as_df() -> pd.DataFrame:
         "factura_plataforma": "factura_plataforma",
     }
     df = df.rename(columns={k: v for k, v in rename_hint.items() if k in df.columns})
+
     return df
+
 
 
 def create_tables(pg: PostgresHook):
@@ -102,19 +121,45 @@ def create_tables(pg: PostgresHook):
 
 
 def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
+    """
+    Carga un DataFrame en Postgres usando COPY, limpiando NaN / <NA> -> NULL.
+    """
     if df.empty:
         return
+
+    df = df.copy()
     cols = list(df.columns)
+
     csv_buf = io.StringIO()
     writer = csv.writer(csv_buf, quoting=csv.QUOTE_MINIMAL)
+
     for row in df.itertuples(index=False, name=None):
-        writer.writerow(["" if v is None else v for v in row])
+        clean_row = []
+        for v in row:
+            # pd.isna() captura NaN, pd.NA, None, etc.
+            if pd.isna(v):
+                clean_row.append("")   # CSV vacío -> NULL en COPY CSV
+            else:
+                clean_row.append(v)
+        writer.writerow(clean_row)
+
     csv_buf.seek(0)
+
     copy_sql = (
         f'COPY {fqtn} ({", ".join(f"{c}" for c in cols)}) '
         "FROM STDIN WITH (FORMAT CSV)"
     )
-    pg.copy_expert(sql=copy_sql, filename=None, data=csv_buf.getvalue())
+
+    conn = pg.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.copy_expert(sql=copy_sql, file=csv_buf)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
 
 
 def stable_owner_id(owner_key: str) -> int:
