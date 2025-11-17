@@ -9,6 +9,11 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.google.suite.hooks.sheets import GSheetsHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
+
+# =========================
+# CONFIG
+# =========================
+
 GOOGLE_CONN_ID = "GoogleSheets"
 POSTGRES_CONN_ID = "Domidai-DB"
 
@@ -23,17 +28,24 @@ EXCLUDED_REFS = {
     "Casa Pedro", "160.1", "160.3", "192", "185", "138", "142"
 }
 
+
+# =========================
+# HELPERS
+# =========================
+
 def _normalize_col(col: str) -> str:
+    # quita tildes, pasa a lower, sustituye espacios/caracteres raros por "_"
     rep = (
-        ("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ñ","n"),
-        ("Á","a"),("É","e"),("Í","i"),("Ó","o"),("Ú","u"),("Ñ","n")
+        ("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u"), ("ñ", "n"),
+        ("Á", "a"), ("É", "e"), ("Í", "i"), ("Ó", "o"), ("Ú", "u"), ("Ñ", "n")
     )
-    for a,b in rep:
-        col = col.replace(a,b)
+    for a, b in rep:
+        col = col.replace(a, b)
     col = col.strip().lower()
     col = re.sub(r"[^a-z0-9]+", "_", col)
     col = re.sub(r"_+", "_", col).strip("_")
     return col
+
 
 def read_sheet_as_df() -> pd.DataFrame:
     hook = GSheetsHook(gcp_conn_id=GOOGLE_CONN_ID)
@@ -42,18 +54,15 @@ def read_sheet_as_df() -> pd.DataFrame:
     if not values or len(values) < 2:
         return pd.DataFrame()
 
-    header = values[0]      # primera fila = nombres de columnas (16)
-    rows = values[1:]       # resto de filas
+    header = values[0]
+    rows = values[1:]
 
-    # --- Normalizar longitud de filas ---
+    # Aseguramos que todas las filas tengan mismo nº de columnas que el header
     n_cols = len(header)
-
     padded_rows = []
     for r in rows:
-        # si la fila tiene menos columnas, rellenamos con ""
         if len(r) < n_cols:
             r = r + [""] * (n_cols - len(r))
-        # si tiene más (por algún motivo), recortamos
         elif len(r) > n_cols:
             r = r[:n_cols]
         padded_rows.append(r)
@@ -61,9 +70,10 @@ def read_sheet_as_df() -> pd.DataFrame:
     df = pd.DataFrame(padded_rows, columns=header).fillna("")
     df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
 
-    # normalizar nombres de columnas
+    # Normalizar nombres de columnas
     df.columns = [_normalize_col(c) for c in df.columns]
 
+    # Renombrado a nombres "canónicos"
     rename_hint = {
         "ref": "ref",
         "nombre": "nombre",
@@ -83,34 +93,96 @@ def read_sheet_as_df() -> pd.DataFrame:
         "factura_plataforma": "factura_plataforma",
     }
     df = df.rename(columns={k: v for k, v in rename_hint.items() if k in df.columns})
+
+    # Eliminar columnas que no queremos usar
     df = df.drop(columns=["estimacion_horas", "tipo_limpieza", "factura_plataforma"], errors="ignore")
+
     return df
+
+
+def stable_owner_id(owner_key: str) -> int:
+    """
+    Genera un entero estable a partir de owner_key usando MD5.
+    Mismo owner_key -> mismo id_propietario siempre.
+    """
+    h = hashlib.md5(owner_key.encode("utf-8")).hexdigest()
+    return int(h[:15], 16)  # 15 hex ~ 60 bits, cabe en BIGINT
+
+
+def build_owner_key(nombre: str, dni: str, cuenta: str, correo: str) -> str:
+    dni = (dni or "").strip()
+    nombre = (nombre or "").strip()
+    cuenta = (cuenta or "").strip()
+    correo = (correo or "").strip()
+
+    if dni:
+        return f"DNI::{dni}"
+    return f"COMP::{nombre}|{cuenta}|{correo}"
+
+
+def parse_ingreso(value):
+    """
+    Convierte la columna ingreso_limpieza:
+    - "50-60" -> 55.0
+    - "30 - 45" -> 37.5
+    - "80" -> 80.0
+    - Otros / no parseable -> None
+    """
+    if pd.isna(value):
+        return None
+
+    s = str(value).strip()
+    if not s:
+        return None
+
+    # número simple
+    if s.replace('.', '', 1).isdigit():
+        return float(s)
+
+    # rango "x-y"
+    if "-" in s:
+        parts = s.split("-")
+        if len(parts) == 2:
+            try:
+                low = float(parts[0].strip())
+                high = float(parts[1].strip())
+                return (low + high) / 2
+            except ValueError:
+                return None
+
+    return None
+
 
 def create_tables(pg: PostgresHook):
     ddl = f"""
+    DROP TABLE IF EXISTS "{TARGET_SCHEMA}"."{TABLE_VIVIENDA_PROP}" CASCADE;
     DROP TABLE IF EXISTS "{TARGET_SCHEMA}"."{TABLE_VIVIENDAS}" CASCADE;
     DROP TABLE IF EXISTS "{TARGET_SCHEMA}"."{TABLE_PROPIETARIOS}" CASCADE;
 
     CREATE TABLE "{TARGET_SCHEMA}"."{TABLE_PROPIETARIOS}" (
         id_propietario       BIGINT PRIMARY KEY,
         nombre               TEXT,
-        cuenta               TEXT,
         dni                  TEXT,
+        cuenta               TEXT,
         correo_electronico   TEXT,
         direccion_fiscal     TEXT
     );
 
     CREATE TABLE "{TARGET_SCHEMA}"."{TABLE_VIVIENDAS}" (
-        ref                       TEXT PRIMARY KEY,
-        id_propietario            BIGINT NOT NULL
-                                  REFERENCES "{TARGET_SCHEMA}"."{TABLE_PROPIETARIOS}"(id_propietario),
+        ref                        TEXT PRIMARY KEY,
         direccion_vivienda_alquilada TEXT,
-        ingreso_limpieza          NUMERIC(12,2),
-        camas                     INTEGER,
-        m2                        INTEGER,
-        dormitorios               INTEGER,
-        banos                     INTEGER,
-        terrazas                  INTEGER
+        ingreso_limpieza           NUMERIC(12,2),
+        camas                      INTEGER,
+        m2                         INTEGER,
+        dormitorios                INTEGER,
+        banos                      INTEGER,
+        terrazas                   INTEGER
+    );
+
+    CREATE TABLE "{TARGET_SCHEMA}"."{TABLE_VIVIENDA_PROP}" (
+        ref            TEXT REFERENCES "{TARGET_SCHEMA}"."{TABLE_VIVIENDAS}"(ref),
+        id_propietario BIGINT REFERENCES "{TARGET_SCHEMA}"."{TABLE_PROPIETARIOS}"(id_propietario),
+        PRIMARY KEY (ref, id_propietario)
     );
     """
     pg.run(ddl)
@@ -118,7 +190,7 @@ def create_tables(pg: PostgresHook):
 
 def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
     """
-    Carga un DataFrame en Postgres usando COPY, limpiando NaN / <NA> -> NULL.
+    Carga un DataFrame en Postgres usando COPY y psycopg2, limpiando NaN/<NA> -> NULL.
     """
     if df.empty:
         return
@@ -132,9 +204,8 @@ def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
     for row in df.itertuples(index=False, name=None):
         clean_row = []
         for v in row:
-            # pd.isna() captura NaN, pd.NA, None, etc.
             if pd.isna(v):
-                clean_row.append("")   # CSV vacío -> NULL en COPY CSV
+                clean_row.append("")  # cadena vacía -> NULL en COPY CSV
             else:
                 clean_row.append(v)
         writer.writerow(clean_row)
@@ -154,100 +225,98 @@ def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
     finally:
         conn.close()
 
-def stable_owner_id(owner_key: str) -> int:
-    """
-    Genera un entero estable a partir de owner_key usando MD5.
-    Mismo owner_key -> mismo id_propietario en todas las ejecuciones.
-    """
-    h = hashlib.md5(owner_key.encode("utf-8")).hexdigest()
-    # 15 hex -> ~60 bits, cabe de sobra en BIGINT
-    return int(h[:15], 16)
 
+# =========================
+# ETL PRINCIPAL
+# =========================
 
 def etl_viviendas_y_propietarios(**_):
     df = read_sheet_as_df()
     if df.empty:
         raise ValueError("La hoja 'VIVIENDAS' está vacía o no se pudo leer.")
 
-    # Normalización de referencias específicas
-    if "ref" in df.columns:
-        df["ref"] = df["ref"].astype(str).str.strip()
-        df["ref"] = df["ref"].replace({
-            "100.1": "100",
-            "100.2": "101"
-        })
-    
-     # Normalizar ingreso limpieza: convertir rangos en media
-    def parse_ingreso(value):
-        if pd.isna(value):
-            return None
+    if "ref" not in df.columns:
+        raise ValueError("No se encontró la columna 'REF' (como 'ref') en la hoja.")
 
-        value = str(value).strip()
+    # Normalizar REF (string, trim)
+    df["ref"] = df["ref"].astype(str).str.strip()
 
-        # caso número simple
-        if value.replace('.', '', 1).isdigit():
-            return float(value)
+    # Normalización específica: 100.1 -> 100, 100.2 -> 101
+    df["ref"] = df["ref"].replace({
+        "100.1": "100",
+        "100.2": "101",
+    })
 
-        # caso rango
-        if "-" in value:
-            parts = value.split("-")
-            if len(parts) == 2:
-                try:
-                    low = float(parts[0].strip())
-                    high = float(parts[1].strip())
-                    return (low + high) / 2
-                except ValueError:
-                    return None
+    # Normalizar INGRESO LIMPIEZA (rango -> media)
+    if "ingreso_limpieza" in df.columns:
+        df["ingreso_limpieza"] = df["ingreso_limpieza"].apply(parse_ingreso)
 
-        return None
+    # Excluir referencias obsoletas
+    df = df[~df["ref"].isin(EXCLUDED_REFS)].copy()
 
-    df["ingreso_limpieza"] = df["ingreso_limpieza"].apply(parse_ingreso)
-
-    # Filtrar viviendas obsoletas
-    if "ref" in df.columns:
-        df = df[~df["ref"].isin(EXCLUDED_REFS)].copy()
-
+    # Convertir numéricos (enteros)
     for c in ("camas", "m2", "dormitorios", "banos", "terrazas"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
 
-    # Clave de propietario: prioriza DNI
-    def owner_key(row):
-        dni = (row.get("dni") or "").strip()
-        if dni:
-            return f"DNI::{dni}"
-        nombre = (row.get("nombre") or "").strip()
-        cuenta = (row.get("cuenta") or "").strip()
-        mail = (row.get("correo_electronico") or "").strip()
-        return f"COMP::{nombre}|{cuenta}|{mail}"
+    # =========================
+    # Construir propietarios y relación vivienda_propietario
+    # =========================
 
-    df["__owner_key__"] = df.apply(owner_key, axis=1)
+    owners_records = []
+    vivienda_prop_records = []
 
-    # Propietarios únicos
-    owner_cols = [
-        c
-        for c in [
-            "nombre",
-            "cuenta",
-            "dni",
-            "correo_electronico",
-            "direccion_fiscal",
-            "__owner_key__",
-        ]
-        if c in df.columns
-    ]
-    propietarios_df = (
-        df[owner_cols]
-        .drop_duplicates(subset=["__owner_key__"])
-        .reset_index(drop=True)
-    )
-    propietarios_df["id_propietario"] = propietarios_df["__owner_key__"].apply(
-        stable_owner_id
-    )
+    for _, row in df.iterrows():
+        nombre_raw = (row.get("nombre") or "").strip()
+        dni_raw = (row.get("dni") or "").strip()
+        cuenta = row.get("cuenta") or ""
+        correo = row.get("correo_electronico") or ""
+        direccion_fiscal = row.get("direccion_fiscal") or ""
+        ref = row["ref"]
 
-    # Viviendas
-    if "ref" not in df.columns:
-        raise ValueError("No se encontró la columna 'REF' (como 'ref') en la hoja.")
+        # Split por " y " para múltiples propietarios
+        nombres = [n.strip() for n in nombre_raw.split(" y ")] if nombre_raw else [""]
+        dnis = [d.strip() for d in dni_raw.split(" y ")] if dni_raw else [""]
+
+        # igualar longitudes
+        max_len = max(len(nombres), len(dnis))
+        while len(nombres) < max_len:
+            nombres.append("")
+        while len(dnis) < max_len:
+            dnis.append("")
+
+        for nombre, dni in zip(nombres, dnis):
+            if not nombre and not dni:
+                continue
+
+            owner_key = build_owner_key(nombre, dni, cuenta, correo)
+            id_prop = stable_owner_id(owner_key)
+
+            owners_records.append({
+                "id_propietario": id_prop,
+                "nombre": nombre,
+                "dni": dni,
+                "cuenta": cuenta,
+                "correo_electronico": correo,
+                "direccion_fiscal": direccion_fiscal,
+            })
+
+            vivienda_prop_records.append({
+                "ref": ref,
+                "id_propietario": id_prop,
+            })
+
+    propietarios_df = pd.DataFrame(owners_records)
+    if not propietarios_df.empty:
+        propietarios_df = propietarios_df.drop_duplicates(subset=["id_propietario"]).reset_index(drop=True)
+
+    vivienda_prop_df = pd.DataFrame(vivienda_prop_records)
+    if not vivienda_prop_df.empty:
+        vivienda_prop_df = vivienda_prop_df.drop_duplicates(subset=["ref", "id_propietario"]).reset_index(drop=True)
+
+    # =========================
+    # Construir viviendas
+    # =========================
 
     viv_cols = [
         "ref",
@@ -258,37 +327,37 @@ def etl_viviendas_y_propietarios(**_):
         "dormitorios",
         "banos",
         "terrazas",
-        "__owner_key__",
     ]
     viv_cols = [c for c in viv_cols if c in df.columns]
-    viviendas_df = df[viv_cols].drop_duplicates(subset=["ref"]).copy()
 
-    viviendas_df = viviendas_df.merge(
-        propietarios_df[["id_propietario", "__owner_key__"]],
-        on="__owner_key__",
-        how="left",
-    )
-    viviendas_df = viviendas_df.drop(columns=["__owner_key__"])
-    col_order = ["ref", "id_propietario"] + [
-        c for c in viviendas_df.columns if c not in ("ref", "id_propietario")
-    ]
-    viviendas_df = viviendas_df[col_order]
+    viviendas_df = df[viv_cols].drop_duplicates(subset=["ref"]).reset_index(drop=True)
+
+    # =========================
+    # Crear tablas y cargar datos
+    # =========================
 
     pg = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
     create_tables(pg)
 
     fq_prop = f'"{TARGET_SCHEMA}"."{TABLE_PROPIETARIOS}"'
     fq_viv = f'"{TARGET_SCHEMA}"."{TABLE_VIVIENDAS}"'
+    fq_vp = f'"{TARGET_SCHEMA}"."{TABLE_VIVIENDA_PROP}"'
 
-    dataframe_to_table_copy(
-        pg,
-        propietarios_df[
-            ["id_propietario", "nombre", "cuenta", "dni", "correo_electronico", "direccion_fiscal"]
-        ],
-        fq_prop,
-    )
-    dataframe_to_table_copy(pg, viviendas_df, fq_viv)
+    if not propietarios_df.empty:
+        dataframe_to_table_copy(pg, propietarios_df[
+            ["id_propietario", "nombre", "dni", "cuenta", "correo_electronico", "direccion_fiscal"]
+        ], fq_prop)
 
+    if not viviendas_df.empty:
+        dataframe_to_table_copy(pg, viviendas_df, fq_viv)
+
+    if not vivienda_prop_df.empty:
+        dataframe_to_table_copy(pg, vivienda_prop_df[["ref", "id_propietario"]], fq_vp)
+
+
+# =========================
+# DAG
+# =========================
 
 default_args = {
     "owner": "rafa",
@@ -300,10 +369,11 @@ with DAG(
     dag_id="gsheets_viviendas_propietarios_to_postgres",
     default_args=default_args,
     start_date=datetime(2025, 11, 1),
-    schedule=None,
+    schedule=None,  # ejecútalo manualmente; cambia a "@daily" si quieres planificarlo
     catchup=False,
     tags=["gsheets", "postgres", "viviendas", "propietarios"],
 ) as dag:
+
     cargar_todo = PythonOperator(
         task_id="extract_transform_load",
         python_callable=etl_viviendas_y_propietarios,
