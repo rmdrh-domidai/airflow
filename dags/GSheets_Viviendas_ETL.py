@@ -9,7 +9,6 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.google.suite.hooks.sheets import GSheetsHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-
 GOOGLE_CONN_ID = "GoogleSheets"
 POSTGRES_CONN_ID = "Domidai-DB"
 
@@ -20,6 +19,9 @@ TARGET_SCHEMA = "public"
 TABLE_PROPIETARIOS = "propietarios"
 TABLE_VIVIENDAS = "viviendas"
 
+EXCLUDED_REFS = {
+    "Casa Pedro", "160.1", "160.3", "192", "185", "138", "142"
+}
 
 def _normalize_col(col: str) -> str:
     rep = (
@@ -32,7 +34,6 @@ def _normalize_col(col: str) -> str:
     col = re.sub(r"[^a-z0-9]+", "_", col)
     col = re.sub(r"_+", "_", col).strip("_")
     return col
-
 
 def read_sheet_as_df() -> pd.DataFrame:
     hook = GSheetsHook(gcp_conn_id=GOOGLE_CONN_ID)
@@ -82,10 +83,8 @@ def read_sheet_as_df() -> pd.DataFrame:
         "factura_plataforma": "factura_plataforma",
     }
     df = df.rename(columns={k: v for k, v in rename_hint.items() if k in df.columns})
-
+    df = df.drop(columns=["estimacion_horas", "tipo_limpieza", "factura_plataforma"], errors="ignore")
     return df
-
-
 
 def create_tables(pg: PostgresHook):
     ddl = f"""
@@ -111,10 +110,7 @@ def create_tables(pg: PostgresHook):
         m2                        INTEGER,
         dormitorios               INTEGER,
         banos                     INTEGER,
-        terrazas                  INTEGER,
-        estimacion_horas          NUMERIC(6,2),
-        tipo_limpieza             TEXT,
-        factura_plataforma        TEXT
+        terrazas                  INTEGER
     );
     """
     pg.run(ddl)
@@ -158,10 +154,6 @@ def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
     finally:
         conn.close()
 
-
-
-
-
 def stable_owner_id(owner_key: str) -> int:
     """
     Genera un entero estable a partir de owner_key usando MD5.
@@ -177,12 +169,47 @@ def etl_viviendas_y_propietarios(**_):
     if df.empty:
         raise ValueError("La hoja 'VIVIENDAS' está vacía o no se pudo leer.")
 
+    # Normalización de referencias específicas
+    if "ref" in df.columns:
+        df["ref"] = df["ref"].astype(str).str.strip()
+        df["ref"] = df["ref"].replace({
+            "100.1": "100",
+            "100.2": "101"
+        })
+    
+     # Normalizar ingreso limpieza: convertir rangos en media
+    def parse_ingreso(value):
+        if pd.isna(value):
+            return None
+
+        value = str(value).strip()
+
+        # caso número simple
+        if value.replace('.', '', 1).isdigit():
+            return float(value)
+
+        # caso rango
+        if "-" in value:
+            parts = value.split("-")
+            if len(parts) == 2:
+                try:
+                    low = float(parts[0].strip())
+                    high = float(parts[1].strip())
+                    return (low + high) / 2
+                except ValueError:
+                    return None
+
+        return None
+
+    df["ingreso_limpieza"] = df["ingreso_limpieza"].apply(parse_ingreso)
+
+    # Filtrar viviendas obsoletas
+    if "ref" in df.columns:
+        df = df[~df["ref"].isin(EXCLUDED_REFS)].copy()
+
     for c in ("camas", "m2", "dormitorios", "banos", "terrazas"):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
-    for c in ("ingreso_limpieza", "estimacion_horas"):
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     # Clave de propietario: prioriza DNI
     def owner_key(row):
@@ -231,9 +258,6 @@ def etl_viviendas_y_propietarios(**_):
         "dormitorios",
         "banos",
         "terrazas",
-        "estimacion_horas",
-        "tipo_limpieza",
-        "factura_plataforma",
         "__owner_key__",
     ]
     viv_cols = [c for c in viv_cols if c in df.columns]
