@@ -23,6 +23,7 @@ RANGE_VIVIENDAS = "VIVIENDAS!A1:Z"
 TARGET_SCHEMA = "public"
 TABLE_PROPIETARIOS = "propietarios"
 TABLE_VIVIENDAS = "viviendas"
+TABLE_VIVIENDA_PROP = "mapeo_vivienda_propietario"
 
 EXCLUDED_REFS = {
     "Casa Pedro", "160.1", "160.3", "192", "185", "138", "142"
