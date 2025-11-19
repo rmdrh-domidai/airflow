@@ -226,6 +226,16 @@ def dataframe_to_table_copy(pg: PostgresHook, df: pd.DataFrame, fqtn: str):
     finally:
         conn.close()
 
+def is_missing_dni_raw(dni) -> bool:
+    """
+    Devuelve True si el DNI está vacío y la fila debe ignorarse:
+    '', '.', '-', None, o solo espacios.
+    """
+    if dni is None:
+        return True
+    s = str(dni).strip()
+    return s in ("", ".", "-")
+
 
 # =========================
 # ETL PRINCIPAL
@@ -239,6 +249,13 @@ def etl_viviendas_y_propietarios(**_):
     if "ref" not in df.columns:
         raise ValueError("No se encontró la columna 'REF' (como 'ref') en la hoja.")
 
+    # Eliminar todas las filas cuyo DNI sea vacío, '.' o similar
+    if "dni" in df.columns:
+        df = df[~df["dni"].apply(is_missing_dni_raw)].copy()
+
+    if df.empty:
+        raise ValueError("Tras filtrar DNIs vacíos no quedan registros válidos.")
+    
     # Normalizar REF (string, trim)
     df["ref"] = df["ref"].astype(str).str.strip()
 
