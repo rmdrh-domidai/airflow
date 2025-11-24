@@ -17,7 +17,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 GOOGLE_CONN_ID = "GoogleSheets"
 POSTGRES_CONN_ID = "Domidai-DB"
 
-SPREADSHEET_ID = "1HSFqe6BE73cE0EqtFgVVcyv7_IFgZ02VteJARMFFwPI"
+SPREADSHEET_ID = "1w3u91eVqcgPin0pQLXkvjRHN6E5Bg-sYkEG63CesTi0"
 RANGE_VIVIENDAS = "VIVIENDAS!A1:Z"
 
 TARGET_SCHEMA = "public"
@@ -387,7 +387,7 @@ with DAG(
     dag_id="gsheets_viviendas_propietarios_to_postgres",
     default_args=default_args,
     start_date=datetime(2025, 11, 1),
-    schedule=None,  # ejecútalo manualmente; cambia a "@daily" si quieres planificarlo
+    schedule="0 21 * * *",
     catchup=False,
     tags=["gsheets", "postgres", "viviendas", "propietarios"],
 ) as dag:
