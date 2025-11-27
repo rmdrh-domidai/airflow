@@ -4,9 +4,11 @@ import json
 import logging
 import requests
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
+from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.hooks.base import BaseHook
+from airflow.models import Variable
+from airflow.utils.emails import send_email
 
 ID_CONEXION_POSTGRES = "Domidai-DB"
 ID_CONEXION_HTTP_AVANTIO = "Avantio_API_test"
@@ -14,6 +16,28 @@ ID_CONEXION_HTTP_AVANTIO = "Avantio_API_test"
 ESQUEMA_BD = "public"
 TABLA_RESERVAS = "reservas"
 TABLA_RESERVAS_EXTRAS = "cargos_extra_reservas"
+
+def notificarFalloETL(context):
+    try:
+        correo = Variable.get("correo_notificaciones")
+    except Exception:
+        logging.error("No se pudo obtener la variable de Airflow 'correo_notificaciones'")
+        return
+    
+    dag_id = context.get("dag").dag_id if context.get("dag") else "desconocido"
+    task_instance = context.get("task_instance")
+    task_id = task_instance.task_id if task_instance else "desconocido"
+    fecha_ejecucion = context.get("execution_date") or context.get("ts")
+    exception = context.get("exception")
+
+    asunto = f"[Airflow] Fallo en DAG: {dag_id}"
+    cuerpo = f"""
+    <h3>Fallo en la ejecución del DAG: {dag_id}</h3>
+    <p><strong>Tarea:</strong> {task_id}</p>
+    <p><strong>Fecha de ejecución:</strong> {fecha_ejecucion}</p>
+    <p><strong>ERROR:</strong> {str(exception)}</p>
+    """
+    send_email(to=correo, subject=asunto, html_content=cuerpo.replace("\n", "<br/>"))
 
 def obtieneConfiguracionAvantio():
     conexion = BaseHook.get_connection(ID_CONEXION_HTTP_AVANTIO)
@@ -254,7 +278,6 @@ def sincronizaReservasAvantio(**_):
         logging.info("No se encontraron reservas para sincronizar.")
         return
     
-    sesion_http = requests.Session()
     filas_reservas = []
     filas_cargos_extras = []
 
@@ -335,7 +358,8 @@ with DAG(
     schedule=None,
     catchup=False,
     max_active_runs=1,
-    tags=["avantio", "postgres", "reservas", "pms", "cargos_extras"]
+    tags=["avantio", "postgres", "reservas", "pms", "cargos_extras"],
+    on_failure_callback=notificarFalloETL,
 ) as dag:
     tarea_sincroniza_reservas = PythonOperator(
         task_id="sincroniza_reservas_avantio",
