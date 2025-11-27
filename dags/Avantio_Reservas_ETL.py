@@ -129,7 +129,7 @@ def construyeFilaReservaPrincipal(reserva):
     return {
         "id_reserva": reserva.get("id"),
         "referencia": reserva.get("reference"),
-        "status": reserva.get("status"),
+        "estado": reserva.get("status"),
         "id_empresa": reserva.get("companyId"),
         "id_alojamiento": alojamiento.get("id") or reserva.get("accommodationId"),
         "fecha_creacion": reserva.get("creationDate"),
@@ -160,3 +160,185 @@ def construyeFilaReservaPrincipal(reserva):
         "fecha_actualizacion": reserva.get("updatedAt"),
         "json_completo": json.dumps(reserva)
     }
+
+def construyeFilasCargosExtras(reserva):
+    id_reserva = reserva.get("id")
+    extras = reserva.get("extras", []) or []
+    filas = []
+
+    for extra in extras:
+        info_extra = extra.get("info", {}) or {}
+        precio_extra = extra.get("price", {}) or {}
+        categoria_extra = info_extra.get("category", {}) or {}
+
+        filas.append({
+            "id_reserva": id_reserva,
+            "referencia_extra": info_extra.get("reference"),
+            "nombre_extra": info_extra.get("name"),
+            "codigo_categoria": categoria_extra.get("code"),
+            "cantidad": extra.get("quantity"),
+            "importe_neto": precio_extra.get("net"),
+            "importe_iva": precio_extra.get("vat"),
+            "importe_impuesto": precio_extra.get("tax"),
+            "fecha_aplicacion": extra.get("applicationDate"),
+            "json_completo": json.dumps(extra)
+        })
+
+    return filas
+
+def aseguraTablasEnBD(gancho_postgres):
+    comando_creacion_reservas = f"""
+    CREATE TABLE IF NOT EXISTS {ESQUEMA_BD}.{TABLA_RESERVAS} (
+        id_reserva TEXT PRIMARY KEY,
+        referencia TEXT,
+        estado TEXT,
+        id_empresa TEXT,
+        id_alojamiento TEXT,
+        fecha_creacion TIMESTAMPTZ,
+        fecha_llegada DATE,
+        fecha_salida DATE,
+        moneda TEXT,
+        importe_total_neto NUMERIC,
+        importe_total_iva NUMERIC,
+        importe_base_neto NUMERIC,
+        importe_base_iva NUMERIC,
+        importe_extras_neto NUMERIC,
+        importe_extras_iva NUMERIC,
+        importe_modificadores_neto NUMERIC,
+        importe_modificadores_iva NUMERIC,
+        importe_impuestos_neto NUMERIC,
+        importe_impuestos_iva NUMERIC,
+        importe_comision_portal NUMERIC,
+        importe_deposito_seguridad NUMERIC,
+        nombre_cliente TEXT,
+        apellidos_cliente TEXT,
+        email_cliente TEXT,
+        telefono_cliente TEXT,
+        check_in_realizado BOOLEAN,
+        estado_check_in TEXT,
+        estado_check_out TEXT,
+        hora_check_in TIME,
+        hora_check_out TIME,
+        fecha_actualizacion TIMESTAMPTZ,
+        json_completo JSONB
+    );
+    """
+
+    comando_creacion_cargos_extras = f"""
+    CREATE TABLE IF NOT EXISTS {ESQUEMA_BD}.{TABLA_RESERVAS_EXTRAS} (
+        id BIGSERIAL PRIMARY KEY,
+        id_reserva TEXT REFERENCES {ESQUEMA_BD}.{TABLA_RESERVAS}(id_reserva),
+        referencia_extra TEXT,
+        nombre_extra TEXT,
+        codigo_categoria TEXT,
+        cantidad INTEGER,
+        importe_neto NUMERIC,
+        importe_iva NUMERIC,
+        importe_impuesto NUMERIC,
+        fecha_aplicacion TIMESTAMPTZ,
+        json_completo JSONB
+    );
+    """
+
+    gancho_postgres.run(comando_creacion_reservas)
+    gancho_postgres.run(comando_creacion_cargos_extras)
+
+def sincronizaReservasAvantio(**_):
+    configuracion = obtieneConfiguracionAvantio()
+    url_base = configuracion["url_base"]
+    api_key = configuracion["api_key"]
+    cabeceras = construyeCabecerasAvantio(api_key)
+
+    ids_reservas = obtieneIdsReservas(url_base, cabeceras)
+    if not ids_reservas:
+        logging.info("No se encontraron reservas para sincronizar.")
+        return
+    
+    sesion_http = requests.Session()
+    filas_reservas = []
+    filas_cargos_extras = []
+
+    for id_reserva in ids_reservas:
+        try:
+            reserva_json = obtieneDetallesReserva(id_reserva, url_base, cabeceras)
+            if not reserva_json:
+                logging.warning("No se obtuvieron detalles para la reserva ID: %s", id_reserva)
+                continue
+
+            filas_reservas.append(construyeFilaReservaPrincipal(reserva_json))
+            filas_cargos_extras.extend(construyeFilasCargosExtras(reserva_json))
+        except Exception as e:
+            logging.error("Error al procesar la reserva ID %s: %s", id_reserva, str(e))
+    
+    if not filas_reservas:
+        logging.info("No hay datos de reservas para insertar en la base de datos.")
+        return
+    
+    campos_reservas = filas_reservas[0].keys()
+    campos_cargos_extras = filas_cargos_extras[0].keys() if filas_cargos_extras else []
+
+    valores_reservas = [[fila[campo] for campo in campos_reservas] for fila in filas_reservas]
+    valores_cargos_extras = [[fila[campo] for campo in campos_cargos_extras] for fila in filas_cargos_extras]
+
+    ids_refrescados = [fila["id_reserva"] for fila in filas_reservas if fila["id_reserva"] is not None]
+
+    gancho_postgres = PostgresHook(postgres_conn_id=ID_CONEXION_POSTGRES)
+    aseguraTablasEnBD(gancho_postgres)
+
+    conexion = gancho_postgres.get_conn()
+    try:
+        with conexion.cursor() as cursor:
+            logging.info("Eliminando reservas y extras para %d IDs de reservas.", len(ids_refrescados))
+
+            sql_borrar_extras = f"""
+            DELETE FROM {ESQUEMA_BD}.{TABLA_RESERVAS_EXTRAS}
+            WHERE id_reserva = ANY(%s);
+            """
+            cursor.execute(sql_borrar_extras, (ids_refrescados,))
+
+            sql_borrar_reservas = f"""
+            DELETE FROM {ESQUEMA_BD}.{TABLA_RESERVAS}
+            WHERE id_reserva = ANY(%s);
+            """
+            cursor.execute(sql_borrar_reservas, (ids_refrescados,))
+
+            sql_insertar_reservas = f"""
+            INSERT INTO {ESQUEMA_BD}.{TABLA_RESERVAS} ({', '.join(campos_reservas)})
+            VALUES ({', '.join(['%s'] * len(campos_reservas))});
+            """
+            cursor.executemany(sql_insertar_reservas, valores_reservas)
+
+            if valores_cargos_extras:
+                sql_insertar_cargos_extras = f"""
+                INSERT INTO {ESQUEMA_BD}.{TABLA_RESERVAS_EXTRAS} ({', '.join(campos_cargos_extras)})
+                VALUES ({', '.join(['%s'] * len(campos_cargos_extras))});
+                """
+                cursor.executemany(sql_insertar_cargos_extras, valores_cargos_extras)
+            
+        conexion.commit()
+        logging.info("Sincronización completada: %d reservas y %d cargos extras insertados.",
+                         len(valores_reservas), len(valores_cargos_extras))
+        
+    finally:
+        conexion.close()
+
+ARGUMENTOS_POR_DEFECTO = {
+    "owner": "rafael martínez del río-hortega",
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+with DAG(
+    dag_id="avantio_reservas_to_postgres",
+    default_args=ARGUMENTOS_POR_DEFECTO,
+    start_date=datetime(2025, 11, 1),
+    schedule=None,
+    catchup=False,
+    max_active_runs=1,
+    tags=["avantio", "postgres", "reservas", "pms", "cargos_extras"]
+) as dag:
+    tarea_sincroniza_reservas = PythonOperator(
+        task_id="sincroniza_reservas_avantio",
+        python_callable=sincronizaReservasAvantio
+    )
+        
