@@ -190,7 +190,6 @@ def construyeFilaReservaPrincipal(reserva):
         "fecha_actualizacion": reserva.get("updatedAt")
     }
 
-    logging.info("Fila de reserva construida: %s", json.dumps(parametros_reserva, default=str))
     return parametros_reserva
 
 def construyeFilasCargosExtras(reserva):
@@ -215,7 +214,7 @@ def construyeFilasCargosExtras(reserva):
             "importe_impuesto": precio_extra.get("tax"),
             "fecha_aplicacion": extra.get("applicationDate")
         })
-    logging.info("Filas de cargos extras construidas: %s", json.dumps(filas, default=str))
+
     return filas
 
 def aseguraTablasEnBD(gancho_postgres):
