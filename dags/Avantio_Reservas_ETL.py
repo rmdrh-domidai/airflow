@@ -8,7 +8,7 @@ from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.hooks.base import BaseHook
 from airflow.models import Variable
-from airflow.utils.emails import send_email
+from airflow.utils.email import send_email
 
 ID_CONEXION_POSTGRES = "Domidai-DB"
 ID_CONEXION_HTTP_AVANTIO = "Avantio_API_test"
@@ -40,6 +40,7 @@ def notificarFalloETL(context):
     send_email(to=correo, subject=asunto, html_content=cuerpo.replace("\n", "<br/>"))
 
 def obtieneConfiguracionAvantio():
+    logging.info("Obteniendo configuración de Avantio desde la conexión Airflow.")
     conexion = BaseHook.get_connection(ID_CONEXION_HTTP_AVANTIO)
     host = conexion.host or ""
     esquema = conexion.schema or ""
@@ -60,15 +61,17 @@ def obtieneConfiguracionAvantio():
     return {"url_base": url_base, "api_key": api_key}
 
 def construyeCabecerasAvantio(api_key):
+    logging.info("Construyendo cabeceras para la API de Avantio.")
     return {"accept": "application/json", "X-Avantio-Auth": api_key}
 
 def obtieneIdsReservas(url_base, cabeceras):
+    logging.info("Obteniendo IDs de reservas desde Avantio.")
     sesion_http = requests.Session()
     url_actual = f"{url_base}/pms/v2/bookings"
     listado_id_reservas = []
 
     while url_actual:
-        logging.info("Llamando al endpoint de lisatr reservas de Avantio: %s", url_actual)
+        logging.info("Llamando al endpoint de listar reservas de Avantio: %s", url_actual)
 
         respuesta = sesion_http.get(url_actual, headers=cabeceras, timeout=30)
         respuesta.raise_for_status()
@@ -86,6 +89,7 @@ def obtieneIdsReservas(url_base, cabeceras):
     return listado_id_reservas
 
 def obtieneDetallesReserva(id_reserva, url_base, cabeceras):
+    logging.info("Obteniendo detalles de la reserva ID: %s", id_reserva)
     sesion_http = requests.Session()
     url = f"{url_base}/pms/v2/bookings/{id_reserva}"
     respuesta = sesion_http.get(url, headers=cabeceras, timeout=30)
@@ -94,6 +98,7 @@ def obtieneDetallesReserva(id_reserva, url_base, cabeceras):
     return cuerpo_respuesta.get("data", {}) or {}
 
 def sumaImportesImpuestos(diccionario_impuestos):
+    logging.info("Sumando importes de impuestos.")
     if not isinstance(diccionario_impuestos, dict):
         return None, None
     
@@ -121,36 +126,37 @@ def sumaImportesImpuestos(diccionario_impuestos):
     return round(suma_neto, 2), round(suma_iva, 2)
 
 def construyeFilaReservaPrincipal(reserva):
+    logging.info("Construyendo fila de reserva principal para ID: %s", reserva.get("id"))
     estancia = reserva.get("stayDates", {}) or {}
     cliente = reserva.get("customer", {}) or {}
     contacto_cliente = cliente.get("contact", {}) or {}
     emails_cliente = contacto_cliente.get("emails", []) or []
-    telefonos_cliente = contacto_cliente.get("phones", []) or []
 
+    telefonos_cliente = contacto_cliente.get("phones", []) or []
     telefono_cliente = None
     if telefonos_cliente and isinstance(telefonos_cliente[0], dict):
         telefono_cliente = telefonos_cliente[0].get("number")
-    
+
     apellidos_cliente = cliente.get("surname", []) or []
     alojamiento = reserva.get("accommodation", {}) or {}
 
     importes = reserva.get("amounts", {}) or {}
-    importe_total = importes.get("total", {}) or {}
+    importe_total = importes.get("total", None) or None
     desglose = importes.get("breakdown", {}) or {}
-    base = desglose.get("base", {}) or {}
-    extras = desglose.get("extras", {}) or {}
-    modificadores = desglose.get("modifiers", {}) or {}
-    impuestos = desglose.get("taxes", {}) or {}
+    base = desglose.get("base", None) or None
+    extras = desglose.get("extras", None) or None
+    modificadores = desglose.get("modifiers", None) or None
+    impuestos = desglose.get("taxes", None) or None
 
     impuestos_neto, impuestos_iva = sumaImportesImpuestos(impuestos)
 
-    comision = importes.get("commission", {}) or {}
-    deposito_seguridad = importes.get("securityDeposit", {}) or {}
+    comision = importes.get("commission", None) or None
+    deposito_seguridad = importes.get("securityDeposit", None) or None
 
-    info_check_in = reserva.get("checkIn", {}) or {}
-    info_check_out = reserva.get("checkOut", {}) or {}
+    info_check_in = reserva.get("checkIn", None) or None
+    info_check_out = reserva.get("checkOut", None) or None
 
-    return {
+    parametros_reserva = {
         "id_reserva": reserva.get("id"),
         "referencia": reserva.get("reference"),
         "estado": reserva.get("status"),
@@ -174,18 +180,21 @@ def construyeFilaReservaPrincipal(reserva):
         "importe_deposito_seguridad": deposito_seguridad,
         "nombre_cliente": cliente.get("name"),
         "apellidos_cliente": " ".join(apellidos_cliente) if apellidos_cliente else None,
-        "email_cliente": emails_cliente[0].get("email") if emails_cliente else None,
+        "email_cliente": emails_cliente[0] if emails_cliente else None,
         "telefono_cliente": telefono_cliente,
         "check_in_realizado": info_check_in.get("done"),
         "estado_check_in": info_check_in.get("status"),
         "estado_check_out": info_check_out.get("status"),
         "hora_check_in": info_check_in.get("checkInTime"),
         "hora_check_out": info_check_out.get("checkOutTime"),
-        "fecha_actualizacion": reserva.get("updatedAt"),
-        "json_completo": json.dumps(reserva)
+        "fecha_actualizacion": reserva.get("updatedAt")
     }
 
+    logging.info("Fila de reserva construida: %s", json.dumps(parametros_reserva, default=str))
+    return parametros_reserva
+
 def construyeFilasCargosExtras(reserva):
+    logging.info("Construyendo filas de cargos extras para la reserva ID: %s", reserva.get("id"))
     id_reserva = reserva.get("id")
     extras = reserva.get("extras", []) or []
     filas = []
@@ -204,13 +213,13 @@ def construyeFilasCargosExtras(reserva):
             "importe_neto": precio_extra.get("net"),
             "importe_iva": precio_extra.get("vat"),
             "importe_impuesto": precio_extra.get("tax"),
-            "fecha_aplicacion": extra.get("applicationDate"),
-            "json_completo": json.dumps(extra)
+            "fecha_aplicacion": extra.get("applicationDate")
         })
-
+    logging.info("Filas de cargos extras construidas: %s", json.dumps(filas, default=str))
     return filas
 
 def aseguraTablasEnBD(gancho_postgres):
+    logging.info("Asegurando que las tablas existen en la base de datos.")
     comando_creacion_reservas = f"""
     CREATE TABLE IF NOT EXISTS {ESQUEMA_BD}.{TABLA_RESERVAS} (
         id_reserva TEXT PRIMARY KEY,
@@ -243,8 +252,7 @@ def aseguraTablasEnBD(gancho_postgres):
         estado_check_out TEXT,
         hora_check_in TIME,
         hora_check_out TIME,
-        fecha_actualizacion TIMESTAMPTZ,
-        json_completo JSONB
+        fecha_actualizacion TIMESTAMPTZ
     );
     """
 
@@ -259,8 +267,7 @@ def aseguraTablasEnBD(gancho_postgres):
         importe_neto NUMERIC,
         importe_iva NUMERIC,
         importe_impuesto NUMERIC,
-        fecha_aplicacion TIMESTAMPTZ,
-        json_completo JSONB
+        fecha_aplicacion TIMESTAMPTZ
     );
     """
 
@@ -268,6 +275,7 @@ def aseguraTablasEnBD(gancho_postgres):
     gancho_postgres.run(comando_creacion_cargos_extras)
 
 def sincronizaReservasAvantio(**_):
+    logging.info("Iniciando sincronización de reservas desde Avantio a PostgreSQL.")
     configuracion = obtieneConfiguracionAvantio()
     url_base = configuracion["url_base"]
     api_key = configuracion["api_key"]
