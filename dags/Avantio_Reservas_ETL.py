@@ -1,5 +1,5 @@
 from __future__ import annotations
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import requests
@@ -42,18 +42,21 @@ def notificarFalloETL(context):
 def parseaFechaISOAware(fecha):
     if fecha is None:
         return None
-    if not isinstance(fecha, str):
-        return None
     if isinstance(fecha, datetime):
+        fecha = fecha.astimezone(timezone.utc)
+        fecha = fecha.replace(tzinfo=None).isoformat(timespec='microseconds')
         return fecha
-    try:
-        if fecha.endswith("Z"):
-            fecha = fecha[:-1] + "+00:00"
-        return datetime.fromisoformat(fecha)
-    except Exception as e:
-        logging.warning("No se ha podido parsear la fecha ISO: %s, error: %s", fecha, str(e))
-        return None
-    
+    if isinstance(fecha, str):
+        try:
+            if fecha.endswith("Z"):
+                fecha = fecha[:-1] + "+00:00"
+            fecha = datetime.fromisoformat(fecha)
+            fecha = fecha.astimezone(timezone.utc)
+            fecha = fecha.replace(tzinfo=None).isoformat(timespec='microseconds')
+            return fecha
+        except Exception:
+            logging.warning("No se pudo parsear la fecha ISO: %s", fecha)
+            return None
 
 def obtieneConfiguracionAvantio():
     logging.info("Obteniendo configuración de Avantio desde la conexión Airflow.")
@@ -80,11 +83,11 @@ def construyeCabecerasAvantio(api_key):
     logging.info("Construyendo cabeceras para la API de Avantio.")
     return {"accept": "application/json", "X-Avantio-Auth": api_key}
 
-def obtieneIdsReservas(url_base, cabeceras):
-    logging.info("Obteniendo IDs de reservas desde Avantio.")
+def obtieneListadoReservas(url_base, cabeceras):
+    logging.info("Obteniendo resumen de reservas desde Avantio.")
     sesion_http = requests.Session()
     url_actual = f"{url_base}/pms/v2/bookings"
-    listado_id_reservas = []
+    listado_reservas = []
 
     while url_actual:
         logging.info("Llamando al endpoint de listar reservas de Avantio: %s", url_actual)
@@ -94,15 +97,25 @@ def obtieneIdsReservas(url_base, cabeceras):
 
         cuerpo_respuesta = respuesta.json()
         reservas = cuerpo_respuesta.get("data", []) or []
+
         for reserva in reservas:
-            if "id" in reserva:
-                listado_id_reservas.append(str(reserva["id"]))
-        
+            reserva_id = reserva.get("id")
+            if not reserva_id:
+                continue
+
+            listado_reservas.append(
+                {
+                    "id": str(reserva_id),
+                    "updatedAt": reserva.get("updatedAt"),
+                }
+            )
+
         enlaces = cuerpo_respuesta.get("_links", {}) or {}
         url_actual = enlaces.get("next")
 
-    logging.info("Total de IDs de reservas obtenidas: %d", len(listado_id_reservas))
-    return listado_id_reservas
+    logging.info("Total de reservas en listado: %d", len(listado_reservas))
+    return listado_reservas
+
 
 def obtieneDetallesReserva(id_reserva, url_base, cabeceras, sesion_http):
     logging.info("Obteniendo detalles de la reserva ID: %s", id_reserva)
@@ -302,20 +315,84 @@ def sincronizaReservasAvantio(**_):
     api_key = configuracion["api_key"]
     cabeceras = construyeCabecerasAvantio(api_key)
 
-    ids_reservas = obtieneIdsReservas(url_base, cabeceras)
-    if not ids_reservas:
+    # 1) Listado de reservas (ID + updatedAt)
+    listado_resumen = obtieneListadoReservas(url_base, cabeceras)
+    if not listado_resumen:
         logging.info("No se encontraron reservas para sincronizar.")
         return
 
+    ids_todas = [r["id"] for r in listado_resumen]
+
+    gancho_postgres = PostgresHook(postgres_conn_id=ID_CONEXION_POSTGRES)
+    aseguraTablasEnBD(gancho_postgres)
+    conexion = gancho_postgres.get_conn()
+
+    # 2) Consultar en BD las reservas existentes y su fecha_actualizacion
+    with conexion.cursor() as cursor:
+        if ids_todas:
+            cursor.execute(
+                f"""
+                SELECT id_reserva, fecha_actualizacion
+                FROM {ESQUEMA_BD}.{TABLA_RESERVAS}
+                WHERE id_reserva = ANY(%s)
+                """,
+                (ids_todas,),
+            )
+            filas_existentes = cursor.fetchall()
+        else:
+            filas_existentes = []
+
+    mapa_existentes = {
+        id_reserva: fecha_actualizacion
+        for (id_reserva, fecha_actualizacion) in filas_existentes
+    }
+
+    # 3) Clasificar: nuevas, actualizadas, sin cambios (sin tocar detalle aún)
+    ids_nuevos = set()
+    ids_actualizar = set()
+
+    for resumen in listado_resumen:
+        id_reserva = resumen["id"]
+        updated_api_str = resumen.get("updatedAt")
+
+        fecha_api = parseaFechaISOAware(updated_api_str)
+        fecha_bd = mapa_existentes.get(id_reserva)
+        fecha_bd_norm = parseaFechaISOAware(fecha_bd)
+
+        if id_reserva not in mapa_existentes:
+            ids_nuevos.add(id_reserva)
+        else:
+            # Si alguna es None o difieren → la marcamos para actualizar
+            if fecha_api is None or fecha_bd_norm is None or fecha_api != fecha_bd_norm:
+                ids_actualizar.add(id_reserva)
+
+    ids_necesitan_detalle = ids_nuevos | ids_actualizar
+
+    logging.info(
+        "Reservas nuevas: %d, reservas a actualizar: %d, reservas sin cambios: %d",
+        len(ids_nuevos),
+        len(ids_actualizar),
+        len(ids_todas) - len(ids_necesitan_detalle),
+    )
+
+    if not ids_necesitan_detalle:
+        logging.info("No hay reservas nuevas ni actualizadas. No se realizan cambios.")
+        return
+
+    # 4) Obtener detalle SOLO de las reservas nuevas + actualizadas
     filas_reservas = []
     filas_cargos_extras = []
 
     sesion_http = requests.Session()
 
-    # 1) Obtener detalle de todas las reservas de la API
-    for id_reserva in ids_reservas:
+    for id_reserva in ids_necesitan_detalle:
         try:
-            reserva_json = obtieneDetallesReserva(id_reserva, url_base, cabeceras, sesion_http)
+            reserva_json = obtieneDetallesReserva(
+                id_reserva=id_reserva,
+                url_base=url_base,
+                cabeceras=cabeceras,
+                sesion_http=sesion_http,
+            )
             if not reserva_json:
                 logging.warning(
                     "No se obtuvieron detalles para la reserva ID: %s",
@@ -337,64 +414,22 @@ def sincronizaReservasAvantio(**_):
             )
 
     if not filas_reservas:
-        logging.info("No hay datos de reservas para insertar en la base de datos.")
+        logging.info("No hay datos de reservas para insertar tras filtrar por cambios.")
         return
 
-    # 2) Consultar qué reservas existen ya en BD y su fecha_actualizacion
-    ids_todas = [
-        fila["id_reserva"]
-        for fila in filas_reservas
-        if fila.get("id_reserva") is not None
-    ]
+    # IDs para los que realmente hemos obtenido detalle
+    ids_con_detalle = {fila["id_reserva"] for fila in filas_reservas}
 
-    gancho_postgres = PostgresHook(postgres_conn_id=ID_CONEXION_POSTGRES)
-    aseguraTablasEnBD(gancho_postgres)
+    ids_nuevos_efectivos = ids_nuevos & ids_con_detalle
+    ids_actualizar_efectivos = ids_actualizar & ids_con_detalle
+    ids_para_insertar = ids_nuevos_efectivos | ids_actualizar_efectivos
 
-    conexion = gancho_postgres.get_conn()
+    if not ids_para_insertar:
+        logging.info(
+            "No se ha podido obtener detalle de ninguna reserva nueva/actualizada. No se realizan cambios."
+        )
+        return
 
-    with conexion.cursor() as cursor:
-        if ids_todas:
-            cursor.execute(
-                f"""
-                SELECT id_reserva, fecha_actualizacion
-                FROM {ESQUEMA_BD}.{TABLA_RESERVAS}
-                WHERE id_reserva = ANY(%s)
-                """,
-                (ids_todas,),
-            )
-            filas_existentes = cursor.fetchall()
-        else:
-            filas_existentes = []
-
-    mapa_existentes = {
-        id_reserva: fecha_actualizacion
-        for (id_reserva, fecha_actualizacion) in filas_existentes
-    }
-
-    # 3) Separar en nuevas vs a actualizar (por updatedAt)
-    nuevas_reservas = []
-    reservas_actualizar = []
-
-    for fila in filas_reservas:
-        id_reserva = fila["id_reserva"]
-        fecha_api_str = fila.get("fecha_actualizacion")
-
-        fecha_api = parseaFechaISOAware(fecha_api_str)
-        fecha_bd = mapa_existentes.get(id_reserva)
-        fecha_bd_norm = parseaFechaISOAware(fecha_bd)
-
-        if id_reserva not in mapa_existentes:
-            nuevas_reservas.append(fila)
-        else:
-            # Si alguna es None o difieren → actualizar
-            if fecha_api is None or fecha_bd_norm is None or fecha_api != fecha_bd_norm:
-                reservas_actualizar.append(fila)
-
-    ids_nuevos = {fila["id_reserva"] for fila in nuevas_reservas}
-    ids_actualizar = {fila["id_reserva"] for fila in reservas_actualizar}
-    ids_para_insertar = ids_nuevos | ids_actualizar
-
-    # 4) Filtrar filas de reservas y extras solo para esos IDs
     filas_reservas_insertar = [
         fila for fila in filas_reservas
         if fila["id_reserva"] in ids_para_insertar
@@ -403,10 +438,6 @@ def sincronizaReservasAvantio(**_):
         fila for fila in filas_cargos_extras
         if fila["id_reserva"] in ids_para_insertar
     ]
-
-    if not filas_reservas_insertar:
-        logging.info("No hay reservas nuevas ni actualizadas. No se insertan cambios.")
-        return
 
     campos_reservas = list(filas_reservas_insertar[0].keys())
     campos_cargos_extras = (
@@ -425,32 +456,32 @@ def sincronizaReservasAvantio(**_):
     ]
 
     logging.info(
-        "Reservas nuevas: %d, reservas a actualizar: %d",
-        len(nuevas_reservas),
-        len(reservas_actualizar),
+        "Reservas nuevas efectivas: %d, reservas a actualizar efectivas: %d",
+        len(ids_nuevos_efectivos),
+        len(ids_actualizar_efectivos),
     )
 
     try:
         with conexion.cursor() as cursor:
-            # 5) Actualizar: borrar primero extras y reservas solo para las que cambian
-            if ids_actualizar:
+            # 5) Para las actualizadas: borrar reservas + cargos extra previos
+            if ids_actualizar_efectivos:
                 logging.info(
                     "Eliminando reservas y cargos extra para %d reservas actualizadas.",
-                    len(ids_actualizar),
+                    len(ids_actualizar_efectivos),
                 )
                 cursor.execute(
                     f"""
                     DELETE FROM {ESQUEMA_BD}.{TABLA_RESERVAS_EXTRAS}
                     WHERE id_reserva = ANY(%s)
                     """,
-                    (list(ids_actualizar),),
+                    (list(ids_actualizar_efectivos),),
                 )
                 cursor.execute(
                     f"""
                     DELETE FROM {ESQUEMA_BD}.{TABLA_RESERVAS}
                     WHERE id_reserva = ANY(%s)
                     """,
-                    (list(ids_actualizar),),
+                    (list(ids_actualizar_efectivos),),
                 )
 
             # 6) Insertar nuevas + actualizadas
