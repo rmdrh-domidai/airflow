@@ -8,7 +8,10 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.suite.hooks.sheets import GSheetsHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.hooks.base import BaseHook
 
+import logging
+import requests
 
 # =========================
 # CONFIG
@@ -16,6 +19,7 @@ from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 GOOGLE_CONN_ID = "GoogleSheets"
 POSTGRES_CONN_ID = "Domidai-DB"
+AVANTIO_API_CONN_ID = "Avantio_API"
 
 SPREADSHEET_ID = "1w3u91eVqcgPin0pQLXkvjRHN6E5Bg-sYkEG63CesTi0"
 RANGE_VIVIENDAS = "VIVIENDAS!A1:Z"
@@ -177,7 +181,8 @@ def create_tables(pg: PostgresHook):
         m2                         INTEGER,
         dormitorios                INTEGER,
         banos                      INTEGER,
-        terrazas                   INTEGER
+        terrazas                   INTEGER,
+        id_avantio                 TEXT
     );
 
     CREATE TABLE "{TARGET_SCHEMA}"."{TABLE_VIVIENDA_PROP}" (
@@ -236,9 +241,70 @@ def is_missing_dni_raw(dni) -> bool:
     s = str(dni).strip()
     return s in ("", ".", "-")
 
+def obtiene_config_avantio():
+    conexion = BaseHook.get_connection(AVANTIO_API_CONN_ID)
+    host = conexion.host or ""
+    esquema = conexion.schema or ""
+
+    if host.startswith("http://") or host.startswith("https://"):
+        url_base = host.rstrip("/")
+    else:
+        url_base = f"{esquema or 'https'}://{host}".rstrip("/")
+
+    extras = conexion.extra_dejson or {}
+    api_key = extras.get("api_key") or conexion.password
+    if not api_key:
+        raise ValueError("La clave API no está configurada en la conexión Avantio.")
+
+    return url_base, api_key
+
+def obtiene_alojamientos_avantio():
+    logging.info("Obteniendo listado de alojamientos desde Avantio...")
+    url_base, api_key = obtiene_config_avantio()
+    cabeceras = {
+        "accept": "application/json",
+        "X-Avantio-Auth": api_key,
+    }
+
+    sesion_http = requests.Session()
+    url_actual = f"{url_base}/pms/v2/accommodations"
+
+    alojamientos = []
+    while url_actual:
+        logging.info("Llamando a %s", url_actual)
+        resp = sesion_http.get(url_actual, headers=cabeceras, timeout=30)
+        resp.raise_for_status()
+        cuerpo = resp.json()
+
+        data = cuerpo.get("data", []) or []
+        for item in data:
+            alojamientos.append({
+                "id": str(item.get("id")),
+                "name": (item.get("name") or "").strip(),
+            })
+        
+        links = cuerpo.get("_links", {}) or {}
+        url_actual = links.get("next")
+    
+    logging.info("Obtenidos %d alojamientos desde Avantio.", len(alojamientos))
+    return alojamientos
+
+def normaliza_ref_a_codigo(ref):
+    if ref is None:
+        return None
+    
+    texto = str(ref).strip()
+    if not texto:
+        return None
+    
+    try:
+        numero = int(texto)
+        return f"{numero:03d}"
+    except ValueError:
+        return texto
 
 # =========================
-# ETL PRINCIPAL
+# ETL PRINCIPALES
 # =========================
 
 def etl_viviendas_y_propietarios(**_):
@@ -372,6 +438,60 @@ def etl_viviendas_y_propietarios(**_):
     if not vivienda_prop_df.empty:
         dataframe_to_table_copy(pg, vivienda_prop_df[["ref", "id_propietario"]], fq_vp)
 
+def sincroniza_id_avantio_en_viviendas():
+    logging.info("Iniciando sincronización de IDs de Avantio en viviendas...")
+    alojamientos = obtiene_alojamientos_avantio()
+    gancho_postgres = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    conn = gancho_postgres.get_conn()
+
+    with conn.cursor() as cursor:
+        cursor.execute(f"SELECT ref FROM {TARGET_SCHEMA}.{TABLE_VIVIENDAS}")
+        filas_viviendas = cursor.fetchall()
+    
+    actualizaciones = []
+    no_encontradas = []
+
+    for alojamiento in alojamientos:
+        alojamiento['name_norm'] = alojamiento['name'].upper()
+    
+    for (ref,) in filas_viviendas:
+        codigo_ref = normaliza_ref_a_codigo(ref)
+        if not codigo_ref:
+            continue
+
+        codigo_busqueda = codigo_ref.upper()
+        candidatos = [
+            alojamiento for alojamiento in alojamientos if codigo_busqueda in alojamiento['name_norm']
+        ]
+
+        if not candidatos:
+            no_encontradas.append(ref)
+            continue
+
+        #Si hay múltiples candidatos, elegir el primero (podría mejorarse)
+        id_avantio = candidatos[0]['id']
+        actualizaciones.append((id_avantio, ref))
+    
+    logging.info("Se han encontrado %d coincidencias para actualizar.", len(actualizaciones))
+
+    if no_encontradas:
+        logging.warning("No se encontraron alojamientos para las siguientes referencias: %s", ", ".join(no_encontradas))
+    
+    if not actualizaciones:
+        logging.info("No hay actualizaciones que realizar.")
+        return
+    
+    with conn.cursor() as cursor:
+        cursor.executemany(
+            f"UPDATE {TARGET_SCHEMA}.{TABLE_VIVIENDAS} SET id_avantio = %s WHERE ref = %s",
+            actualizaciones
+        )
+    
+    conn.commit()
+    conn.close()
+
+    logging.info("Sincronización de IDs de Avantio completada, viviendas actualizadas: %d", len(actualizaciones))
+
 
 # =========================
 # DAG
@@ -396,3 +516,10 @@ with DAG(
         task_id="extract_transform_load",
         python_callable=etl_viviendas_y_propietarios,
     )
+
+    sincronizar_ids_avantio = PythonOperator(
+        task_id="sincronizar_ids_avantio",
+        python_callable=sincroniza_id_avantio_en_viviendas,
+    )
+
+    cargar_todo >> sincronizar_ids_avantio
