@@ -11,7 +11,7 @@ from airflow.models import Variable
 from airflow.utils.email import send_email
 
 ID_CONEXION_POSTGRES = "Domidai-DB"
-ID_CONEXION_HTTP_AVANTIO = "Avantio_API_test"
+ID_CONEXION_HTTP_AVANTIO = "Avantio_API"
 
 ESQUEMA_BD = "public"
 TABLA_RESERVAS = "reservas"
@@ -164,6 +164,7 @@ def construyeFilaReservaPrincipal(reserva):
     logging.info("Construyendo fila de reserva principal para ID: %s", reserva.get("id"))
     estancia = reserva.get("stayDates", {}) or {}
     cliente = reserva.get("customer", {}) or {}
+    plataforma = reserva.get("salesChannel", {}) or {}
     contacto_cliente = cliente.get("contact", {}) or {}
     emails_cliente = contacto_cliente.get("emails", []) or []
 
@@ -197,6 +198,7 @@ def construyeFilaReservaPrincipal(reserva):
         "estado": reserva.get("status"),
         "id_empresa": reserva.get("companyId"),
         "id_alojamiento": alojamiento.get("id") or reserva.get("accommodationId"),
+        "plataforma": plataforma.get("name"),
         "fecha_creacion": reserva.get("creationDate"),
         "fecha_llegada": estancia.get("arrival"),
         "fecha_salida": estancia.get("departure"),
@@ -261,6 +263,7 @@ def aseguraTablasEnBD(gancho_postgres):
         estado TEXT,
         id_empresa TEXT,
         id_alojamiento TEXT,
+        plataforma TEXT,
         fecha_creacion TIMESTAMPTZ,
         fecha_llegada DATE,
         fecha_salida DATE,
