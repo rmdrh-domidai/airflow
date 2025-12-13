@@ -522,7 +522,7 @@ with DAG(
     dag_id="avantio_reservas_to_postgres",
     default_args=ARGUMENTOS_POR_DEFECTO,
     start_date=datetime(2025, 11, 1),
-    schedule=None,
+    schedule="0 */3 * * *",
     catchup=False,
     max_active_runs=1,
     tags=["avantio", "postgres", "reservas", "pms", "cargos_extras"],
